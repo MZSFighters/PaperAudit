@@ -85,10 +85,11 @@ def _extract_citation_keys_from_section_blocks(
             t = b.get("text") or ""
             if t:
                 text_parts.append(t)
-    full_text = "\n".join(text_parts)
+    full_text = unicodedata.normalize("NFC", "\n".join(text_parts))
 
     author_year_keys: List[Tuple[str, str]] = []
     numeric_keys: List[str] = []
+    multi_author_spans = []
 
     # Keep an optional year suffix (e.g., 2024a) and accept Unicode surnames.
     surname_token = r"([^\W\d_][\w'’.-]*)"
@@ -104,8 +105,9 @@ def _extract_citation_keys_from_section_blocks(
         re.IGNORECASE,
     )
     for m in pattern_et_al.finditer(full_text):
+        multi_author_spans.append(m.span())
         surname = _normalize_for_matching(m.group(1).strip())
-        year = m.group(2).strip()
+        year = m.group(2).strip().casefold()
         key = (surname, year)
         if key not in author_year_keys:
             author_year_keys.append(key)
@@ -117,8 +119,9 @@ def _extract_citation_keys_from_section_blocks(
         re.IGNORECASE,
     )
     for m in pattern_and.finditer(full_text):
+        multi_author_spans.append(m.span())
         surname = _normalize_for_matching(m.group(1).strip())
-        year = m.group(3).strip()
+        year = m.group(3).strip().casefold()
         key = (surname, year)
         if key not in author_year_keys:
             author_year_keys.append(key)
@@ -131,11 +134,14 @@ def _extract_citation_keys_from_section_blocks(
         re.IGNORECASE,
     )
     for m in pattern_single.finditer(full_text):
+        # Do not reinterpret a coauthor or "al." as a separate citation.
+        if any(start <= m.start() < end for start, end in multi_author_spans):
+            continue
         surname_raw = m.group(1).strip()
-        if surname_raw.lower() in _SURNAME_STOPWORDS:
+        if surname_raw.casefold().rstrip(".") in _SURNAME_STOPWORDS:
             continue
         surname = _normalize_for_matching(surname_raw)
-        year = m.group(2).strip()
+        year = m.group(2).strip().casefold()
         key = (surname, year)
         if key not in author_year_keys:
             author_year_keys.append(key)
@@ -168,22 +174,24 @@ def _match_reference_entries(
 
     # Fallback: if a "paragraph" bundles more than one entry (no blank line was
     # preserved between them in the source), split it further on entry-start
-    # boundaries like "Surname, X." or "[12]". Without this, only the first
+    # boundaries like "Surname, X.". Without this, only the first
     # entry in a merged block is ever matched.
     entry_start = re.compile(
         r"(?:^|\n)(?=(?:\[\d+\]\s*)?[A-Z][A-Za-z'’\-]+,\s+[A-Z]\.)"
     )
     split_paragraphs: List[str] = []
     for para in paragraphs:
-        starts = list(entry_start.finditer(para))
-        if len(starts) > 1:
-            bounds = [m.start() for m in starts] + [len(para)]
-            for i in range(len(bounds) - 1):
-                chunk = para[bounds[i]:bounds[i + 1]].strip()
-                if chunk:
-                    split_paragraphs.append(chunk)
-        else:
-            split_paragraphs.append(para)
+        bounds = [0]
+        for match in entry_start.finditer(para):
+            if match.start() == 0:
+                continue
+            previous = para[bounds[-1]:match.start()].strip()
+            # An author list may wrap at a coauthor's surname. Split only after
+            # a completed entry containing a year, retaining the full prefix.
+            if previous.endswith(".") and re.search(r"\b(?:19|20)\d{2}[a-z]?\b", previous):
+                bounds.append(match.start())
+        bounds.append(len(para))
+        split_paragraphs.extend(para[a:b].strip() for a, b in zip(bounds, bounds[1:]) if para[a:b].strip())
     paragraphs = split_paragraphs
 
     used_entries: List[str] = []
@@ -191,7 +199,7 @@ def _match_reference_entries(
 
     # Process author-year first
     for surname, year in author_year_keys:
-        esc_surname = re.escape(surname)
+        esc_surname = re.escape(_normalize_for_matching(surname))
         exact_year = re.compile(
             rf"(?<!\d){re.escape(year.casefold())}(?![a-z0-9])",
             re.IGNORECASE,
@@ -208,17 +216,10 @@ def _match_reference_entries(
             re.IGNORECASE,
         )
         first_author_natural = re.compile(
-            rf"^\s*(?:\[\d+\]\s*)?(?:[a-z][\w'’\-\.]*\s+){{1,4}}{esc_surname}\b(?:\s*,|\s+and\b|\s*\.)",
+            rf"^\s*(?:\[\d+\]\s*)?(?:(?!and\b|et\b|al\b)(?:[^\W\d_][\w'’\-]*|[^\W\d_]\.)\s+){{1,4}}{esc_surname}\b(?:\s*,|\s+and\b|\s*&|\s*\.)",
             re.IGNORECASE,
         )
-        # Loose fallback only: surname appears anywhere near the start of
-        # the entry. Used only when no entry satisfies the strict first-
-        # author check above, as a last resort for bibliography styles we
-        # haven't anticipated.
-        loose_surname = re.compile(rf"\b{esc_surname}\b", re.IGNORECASE)
-
         strict_match = None
-        loose_match = None
         for para in paragraphs:
             normalized_entry = _normalize_for_matching(para.replace("\n", " "))
             if not exact_year.search(normalized_entry):
@@ -226,10 +227,7 @@ def _match_reference_entries(
             if first_author_inverted.search(normalized_entry) or first_author_natural.search(normalized_entry):
                 strict_match = para
                 break
-            if loose_match is None and loose_surname.search(normalized_entry[:200]):
-                loose_match = para
-
-        chosen = strict_match if strict_match is not None else loose_match
+        chosen = strict_match
         if chosen is not None:
             entry_key = chosen.strip()
             if entry_key not in seen_paragraphs:
